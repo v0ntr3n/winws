@@ -1,0 +1,400 @@
+--- a/nfq/Makefile
++++ b/nfq/Makefile
+@@ -1,5 +1,5 @@
+ CC ?= cc
+-OPTIMIZE ?= -Os
++OPTIMIZE ?= -O3 -march=native -mtune=native -flto -fomit-frame-pointer -DNDEBUG
+ CFLAGS += -std=gnu99 $(OPTIMIZE) -flto=auto -ffunction-sections -fdata-sections
+ CFLAGS_SYSTEMD = -DUSE_SYSTEMD
+ CFLAGS_BSD = -Wno-address-of-packed-member
+@@ -9,7 +9,7 @@
+ LDFLAGS_BSD = -Wl,--gc-sections
+ LDFLAGS_LINUX = -Wl,--gc-sections
+ LDFLAGS_MAC = -Wl,-dead_strip
+-LDFLAGS_WIN = -Wl,--gc-sections
++LDFLAGS_WIN = -s -flto -Wl,--gc-sections
+ LIBS_LINUX = -lz -lnetfilter_queue -lnfnetlink -lmnl
+ LIBS_SYSTEMD = -lsystemd
+ LIBS_BSD = -lz
+@@ -47,6 +47,9 @@
+ 	$(CC) -s $(CFLAGS) $(CFLAGS_CYGWIN) -o winws $(SRC_FILES) $(LIBS_CYGWIN) $(LIBS_CYGWIN32) $(RES_CYGWIN32) $(LDFLAGS) $(LDFLAGS_WIN)
+ cygwin: cygwin64
+ 
++.PHONY: winws
++winws: cygwin64
++
+ clean:
+ 	rm -f nfqws dvtws winws.exe
+ 
+--- a/nfq/darkmagic.c
++++ b/nfq/darkmagic.c
+@@ -1056,11 +1056,8 @@
+ // scale_factor=SCALE_NONE - do not change
+ void tcp_rewrite_winsize(struct tcphdr *tcp, uint16_t winsize, uint8_t scale_factor)
+ {
+-	uint16_t winsize_old;
+-
+-	winsize_old = htons(tcp->th_win); // << scale_factor;
++	DLOG("Window size change %u => %u\n", htons(tcp->th_win), winsize);
+ 	tcp->th_win = htons(winsize);
+-	DLOG("Window size change %u => %u\n", winsize_old, winsize);
+ 
+ 	tcp_rewrite_wscale(tcp, scale_factor);
+ }
+@@ -1419,6 +1416,8 @@
+ 
+ static bool logical_net_filter_match_rate_limited(void)
+ {
++	// Avoid even the clock read when neither logical network filter is enabled.
++	if (!wlan_filter_ssid && !nlm_filter_net) return true;
+ 	DWORD dwTick = GetTickCount() / 1000;
+ 	if (logical_net_filter_tick == dwTick) return true;
+ 	logical_net_filter_tick = dwTick;
+@@ -2321,7 +2320,7 @@
+ 
+ void dbgprint_socket_buffers(int fd)
+ {
+-	if (params.debug)
++	if (DEBUG_ENABLED)
+ 	{
+ 		int v;
+ 		socklen_t sz;
+--- a/nfq/desync.c
++++ b/nfq/desync.c
+@@ -85,15 +85,15 @@
+ 
+ static void TLSDebugHandshake(const uint8_t *tls, size_t sz)
+ {
+-	if (!params.debug) return;
++	if (!DEBUG_ENABLED) return;
+ 
+ 	if (sz < 6) return;
+ 
+ 	const uint8_t *ext;
+ 	size_t len, len2;
+ 
+-	uint16_t v_handshake = pntoh16(tls + 4), v, v2;
+-	DLOG("TLS handshake version : %s\n", TLSVersionStr(v_handshake));
++	uint16_t v, v2;
++	DLOG("TLS handshake version : %s\n", TLSVersionStr(pntoh16(tls + 4)));
+ 
+ 	if (TLSFindExtInHandshake(tls, sz, 43, &ext, &len, false))
+ 	{
+@@ -146,7 +146,7 @@
+ }
+ static void TLSDebug(const uint8_t *tls, size_t sz)
+ {
+-	if (!params.debug) return;
++	if (!DEBUG_ENABLED) return;
+ 
+ 	if (sz < 11) return;
+ 
+@@ -284,7 +284,7 @@
+ 	bool *bCheckDone, bool *bCheckResult, bool *bExcluded)
+ {
+ 	struct desync_profile_list *dpl;
+-	if (params.debug)
++	if (DEBUG_ENABLED)
+ 	{
+ 		char ip_port[48];
+ 		ntop46_port(dest, ip_port, sizeof(ip_port));
+@@ -542,7 +542,7 @@
+ {
+ 	return reasm_feed(ctrack, &ctrack->reasm_orig, proto, data_payload, len_payload);
+ }
+-static void reasm_orig_stop(t_ctrack *ctrack, const char *dlog_msg)
++static void reasm_orig_stop(t_ctrack *ctrack, const char *dlog_msg __attribute__((unused)))
+ {
+ 	if (ctrack)
+ 	{
+@@ -733,7 +733,7 @@
+ 	return (split_pos > reasm_offset && (split_pos - reasm_offset) < len_payload) ? split_pos - reasm_offset : 0;
+ }
+ 
+-static uint8_t autottl_guess(autottl *attl, uint8_t hop_count, const char *attl_kind)
++static uint8_t autottl_guess(autottl *attl, uint8_t hop_count, const char *attl_kind __attribute__((unused)))
+ {
+ 	if (AUTOTTL_ENABLED(*attl))
+ 	{
+@@ -880,7 +880,7 @@
+ // fake_mod buffer must at least sizeof(desync_profile->fake_tls)
+ // size does not change
+ // return : true - altered, false - not altered
+-static bool runtime_tls_mod(int fake_n, const struct fake_tls_mod_cache *modcache, const struct fake_tls_mod *tls_mod, const uint8_t *fake_data, size_t fake_data_size, const uint8_t *payload, size_t payload_len, uint8_t *fake_mod)
++static bool runtime_tls_mod(int fake_n __attribute__((unused)), const struct fake_tls_mod_cache *modcache, const struct fake_tls_mod *tls_mod, const uint8_t *fake_data, size_t fake_data_size, const uint8_t *payload, size_t payload_len, uint8_t *fake_mod)
+ {
+ 	bool b = false;
+ 	if (modcache) // it's filled only if it's TLS
+@@ -932,7 +932,7 @@
+ 	return b;
+ }
+ 
+-static bool rewrite_tcp_flags(uint16_t *flags, uint16_t unset, uint16_t set, const char *what)
++static bool rewrite_tcp_flags(uint16_t *flags, uint16_t unset, uint16_t set, const char *what __attribute__((unused)))
+ {
+ 	if (set || unset)
+ 	{
+@@ -1018,7 +1018,7 @@
+ 		uint8_t ttl_orig, ttl_dup, scale_factor;
+ 		uint16_t flags_dup;
+ 		uint32_t *timestamps;
+-		bool sack, DF, bTF;
++		bool sack, bTF;
+ 
+ 		extract_endpoints(dis->ip, dis->ip6, dis->tcp, NULL, &src, &dst);
+ 		ttl_orig = dis->ip ? dis->ip->ip_ttl : dis->ip6->ip6_ctlun.ip6_un1.ip6_un1_hlim;
+@@ -1375,7 +1375,7 @@
+ 			dis->tcp->th_flags &= ~TH_ACK;
+ 			tcp_fix_checksum(dis->tcp, dis->transport_len, dis->ip, dis->ip6);
+ 
+-			char ss[2], i;
++			char ss[2];
+ 			if (dp->synack_split == SS_SYNACK)
+ 			{
+ 				ss[0] = 'S';
+@@ -1510,7 +1510,8 @@
+ 
+ 		process_retrans_fail(ctrack, IPPROTO_TCP, (struct sockaddr*)&src);
+ 
+-		if (IsHttp(rdata_payload, rlen_payload))
++		if (!params.tls_clienthello_only && dis->tcp->th_dport != htons(443) &&
++			IsHttp(rdata_payload, rlen_payload))
+ 		{
+ 			DLOG("packet contains HTTP request\n");
+ 			l7proto = HTTP;
+@@ -1801,7 +1802,7 @@
+ 			goto send_orig;
+ 		}
+ 
+-		if (params.debug)
++		if (DEBUG_ENABLED)
+ 		{
+ 			char s1[48], s2[48];
+ 			ntop46_port((struct sockaddr *)&src, s1, sizeof(s1));
+@@ -1825,7 +1826,7 @@
+ 		{
+ 			split_pos = 0;
+ 			ResolveMultiPos(rdata_payload, rlen_payload, l7proto, dp->splits, dp->split_count, multisplit_pos, &multisplit_count);
+-			if (params.debug)
++			if (DEBUG_ENABLED)
+ 			{
+ 				if (multisplit_count)
+ 				{
+@@ -1845,7 +1846,7 @@
+ 					if (multisplit_pos[j]) j++;
+ 				}
+ 				multisplit_count = j;
+-				if (params.debug)
++				if (DEBUG_ENABLED)
+ 				{
+ 					if (multisplit_count)
+ 					{
+@@ -2747,7 +2748,7 @@
+ }
+ 
+ // return : true - should continue, false - should stop with verdict
+-static bool quic_reasm_cancel(t_ctrack *ctrack, const char *reason)
++static bool quic_reasm_cancel(t_ctrack *ctrack, const char *reason __attribute__((unused)))
+ {
+ 	reasm_orig_cancel(ctrack);
+ 	if (ctrack && ctrack->dp && ctrack->dp->desync_any_proto)
+@@ -3223,7 +3224,7 @@
+ 
+ 		uint32_t fooling_orig = FOOL_NONE;
+ 
+-		if (params.debug)
++		if (DEBUG_ENABLED)
+ 		{
+ 			char s1[48], s2[48];
+ 			ntop46_port((struct sockaddr *)&src, s1, sizeof(s1));
+@@ -3401,7 +3402,7 @@
+ 
+ static void packet_debug(bool replay, const struct dissect *dis)
+ {
+-	if (params.debug)
++	if (DEBUG_ENABLED)
+ 	{
+ 		if (replay) DLOG("REPLAY ");
+ 		if (dis->ip)
+@@ -3443,6 +3444,14 @@
+ 	uint8_t verdict = VERDICT_PASS;
+ 
+ 	proto_dissect_l3l4(data_pkt, *len_pkt, &dis);
++	if (params.tls_clienthello_only &&
++		(!dis.ip || !dis.tcp || dis.tcp->th_dport != htons(443) ||
++		 dis.len_payload <= 40 || dis.data_payload[0] != 22 || dis.data_payload[5] != 1))
++		return VERDICT_PASS;
++#ifdef __CYGWIN__
++	if (dis.udp && params.wf_skip_udp)
++		return VERDICT_PASS;
++#endif
+ 	if (!!dis.ip != !!dis.ip6)
+ 	{
+ 		packet_debug(replay, &dis);
+--- a/nfq/nfqws.c
++++ b/nfq/nfqws.c
+@@ -1425,7 +1425,7 @@
+ 				size_t slen_new = strlen(tls_mod->sni);
+ 				ssize_t slen_delta = slen_new - slen;
+ 				char *s1 = NULL;
+-				if (params.debug)
++				if (DEBUG_ENABLED)
+ 				{
+ 					if ((s1 = malloc(slen + 1)))
+ 					{
+@@ -1464,7 +1464,7 @@
+ 				}
+ 
+ 				char *s1 = NULL, *s2 = NULL;
+-				if (params.debug)
++				if (DEBUG_ENABLED)
+ 				{
+ 					if ((s1 = malloc(slen + 1)))
+ 					{
+@@ -1482,7 +1482,7 @@
+ 				else
+ 					fill_random_az09(sni + 1, slen - 1);
+ 
+-				if (params.debug)
++				if (DEBUG_ENABLED)
+ 				{
+ 					if (s1 && (s2 = malloc(slen + 1)))
+ 					{
+@@ -1675,6 +1675,8 @@
+ 
+ #define DIVERT_PROLOG "!impostor and !loopback"
+ 
++#define DIVERT_TLS_CLIENTHELLO_ONLY "outbound and ip and tcp.DstPort == 443 and tcp.PayloadLength > 40 and tcp.Payload[0] == 22 and tcp.Payload[5] == 1"
++
+ static bool wf_make_filter(
+ 	char *wf, size_t len,
+ 	unsigned int IfIdx, unsigned int SubIfIdx,
+@@ -1790,6 +1792,7 @@
+ 		" --wf-l3=ipv4|ipv6\t\t\t\t\t; L3 protocol filter. multiple comma separated values allowed.\n"
+ 		" --wf-tcp=[~]port1[-port2]\t\t\t\t; TCP port filter. ~ means negation. multiple comma separated values allowed.\n"
+ 		" --wf-udp=[~]port1[-port2]\t\t\t\t; UDP port filter. ~ means negation. multiple comma separated values allowed.\n"
++		" --wf-tls-clienthello-only\t\t\t\t; stateless IPv4 TLS on TCP 443; no TCP state options\n"
+ 		" --wf-raw-part=<filter>|@<filename>\t\t\t; partial raw windivert filter string or filename\n"
+ 		" --wf-filter-lan=0|1\t\t\t\t\t; add excluding filter for non-global IP (default : 1)\n"
+ 		" --wf-raw=<filter>|@<filename>\t\t\t\t; full raw windivert filter string or filename. replaces --wf-tcp,--wf-udp,--wf-raw-part\n"
+@@ -2130,6 +2133,7 @@
+ 	IDX_WF_UDP,
+ 	IDX_WF_RAW,
+ 	IDX_WF_RAW_PART,
++	IDX_WF_TLS_CLIENTHELLO_ONLY,
+ 	IDX_WF_FILTER_LAN,
+ 	IDX_WF_SAVE,
+ 	IDX_SSID_FILTER,
+@@ -2271,6 +2275,7 @@
+ 	[IDX_WF_UDP] = {"wf-udp", required_argument, 0, 0},
+ 	[IDX_WF_RAW] = {"wf-raw", required_argument, 0, 0},
+ 	[IDX_WF_RAW_PART] = {"wf-raw-part", required_argument, 0, 0},
++	[IDX_WF_TLS_CLIENTHELLO_ONLY] = {"wf-tls-clienthello-only", no_argument, 0, 0},
+ 	[IDX_WF_FILTER_LAN] = {"wf-filter-lan", required_argument, 0, 0},
+ 	[IDX_WF_SAVE] = {"wf-save", required_argument, 0, 0},
+ 	[IDX_SSID_FILTER] = {"ssid-filter", required_argument, 0, 0},
+@@ -2399,7 +2404,7 @@
+ #ifdef __ANDROID__
+ 				else if (!strcmp(optarg, "android"))
+ 				{
+-					if (!params.debug) params.debug = 1;
++					if (!DEBUG_ENABLED) params.debug = 1;
+ 					params.debug_target = LOG_TARGET_ANDROID;
+ 				}
+ #endif
+@@ -3373,6 +3378,9 @@
+ 				strncpy(windivert_filter, optarg, sizeof(windivert_filter));
+ 				windivert_filter[sizeof(windivert_filter) - 1] = '\0';
+ 			}
++			break;
++		case IDX_WF_TLS_CLIENTHELLO_ONLY:
++			params.tls_clienthello_only = true;
+ 			break;
+ 		case IDX_WF_RAW_PART:
+ 			hash_wf_raw_part ^= hash_jen(optarg, strlen(optarg));
+@@ -3548,6 +3556,49 @@
+ 	DLOG("\n");
+ 
+ #ifdef __CYGWIN__
++	// Decide before constructing the generated filter. Raw overrides may capture UDP.
++	params.wf_skip_udp = !*wf_pf_udp_src && !*windivert_filter && LIST_EMPTY(&params.wf_raw_part);
++	if (params.tls_clienthello_only)
++	{
++		if (*windivert_filter || !LIST_EMPTY(&params.wf_raw_part) ||
++			*wf_pf_tcp_src || *wf_pf_udp_src || IfIdx || !wf_ipv4 || !wf_ipv6)
++		{
++			DLOG_ERR("--wf-tls-clienthello-only cannot be combined with other capture filters\n");
++			exit_clean(1);
++		}
++		LIST_FOREACH(dpl, &params.desync_profiles, next)
++		{
++			dp = &dpl->dp;
++			if (dp->hostlist_auto || dp->desync_start || dp->desync_cutoff ||
++				dp->wsize || dp->wssize || dp->synack_split || dp->dup_repeats ||
++				dp->orig_mod_start || dp->orig_mod_cutoff ||
++				dp->desync_mode0 != DESYNC_NONE || dp->desync_mode2 != DESYNC_NONE ||
++				(dp->desync_mode != DESYNC_NONE && dp->desync_mode != DESYNC_MULTISPLIT &&
++				 dp->desync_mode != DESYNC_MULTIDISORDER))
++			{
++				DLOG_ERR("--wf-tls-clienthello-only requires stateless multisplit/multidisorder without cutoff, auto hostlist, SYN or window/dup options (profile %d)\n", dp->n);
++				exit_clean(1);
++			}
++		}
++		if (params.autottl_present || params.cache_hostname)
++		{
++			DLOG_ERR("--wf-tls-clienthello-only does not support autottl or hostname caching\n");
++			exit_clean(1);
++		}
++		params.ctrack_disable = true;
++		params.wf_skip_udp = true;
++		strcpy(windivert_filter, DIVERT_TLS_CLIENTHELLO_ONLY);
++		hash_wf_raw = hash_jen(windivert_filter, strlen(windivert_filter));
++		const char *filter_error = NULL;
++		UINT filter_error_pos = 0;
++		if (!WinDivertHelperCompileFilter(windivert_filter, WINDIVERT_LAYER_NETWORK,
++			NULL, 0, &filter_error, &filter_error_pos))
++		{
++			DLOG_ERR("TLS-only filter error at %u: %s\n", filter_error_pos,
++				filter_error ? filter_error : "unknown error");
++			exit_clean(1);
++		}
++	}
+ 	if (!*windivert_filter)
+ 	{
+ 		if (!*wf_pf_tcp_src && !*wf_pf_udp_src && LIST_EMPTY(&params.wf_raw_part))
+--- a/nfq/params.c
++++ b/nfq/params.c
+@@ -1,3 +1,4 @@
++#define PARAMS_LOG_IMPLEMENTATION
+ #include "params.h"
+ 
+ #include <stdarg.h>
+--- a/nfq/params.h
++++ b/nfq/params.h
+@@ -250,6 +250,11 @@
+ 	unsigned int ctrack_t_syn, ctrack_t_est, ctrack_t_fin, ctrack_t_udp;
+ 	t_conntrack conntrack;
+ 	bool ctrack_disable;
++	// Explicit stateless IPv4 ClientHello capture; normal filters retain conntrack.
++	bool tls_clienthello_only;
++#ifdef __CYGWIN__
++	bool wf_skip_udp;
++#endif
+ 
+ 	bool autottl_present;
+ #ifdef HAS_FILTER_SSID
+@@ -275,3 +280,14 @@
+ int HOSTLIST_DEBUGLOG_APPEND(const char *format, ...);
+ void hexdump_limited_dlog(const uint8_t *data, size_t size, size_t limit);
+ 
++// Keep errors and startup/status messages, remove verbose calls and arguments.
++#ifdef NDEBUG
++#define DEBUG_ENABLED false
++#ifndef PARAMS_LOG_IMPLEMENTATION
++#define DLOG(...) ((void)0)
++#define hexdump_limited_dlog(...) ((void)0)
++#endif
++#else
++#define DEBUG_ENABLED params.debug
++#endif
++

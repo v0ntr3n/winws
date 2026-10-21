@@ -1,0 +1,7 @@
+/nfq/nfqws
+/nfq/dvtws
+/nfq/winws.exe
+/dist/*.exe
+/dist/*.dll
+/dist/*.sys
+/*.zip

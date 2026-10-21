@@ -1,0 +1,1 @@
+outbound and ip and tcp.DstPort == 443 and tcp.PayloadLength > 40 and tcp.Payload[0] == 22 and tcp.Payload[5] == 1
